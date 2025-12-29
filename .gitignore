@@ -1,3 +1,7 @@
+#downloaded files
+*.pdf
+gem_downloader/latest/pdfs/debug_html/*.html
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
