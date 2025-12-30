@@ -1,11 +1,31 @@
+#!/usr/bin/env python3
+"""
+GeM latest bid fetcher + PDF downloader + optional S3 upload (date-partitioned).
+
+Key features:
+- POSTs to https://bidplus.gem.gov.in/all-bids-data using the same payload shape as the GeM UI.
+- Sort: Bid-Start-Date-Latest (newest first)
+- Filters: keyword (fullText) + consignee state match (broad scan across doc fields)
+- Robust normalization for fields that sometimes arrive as lists (b_id, bid_number, date_sort fields)
+- PDF download:
+  - Accepts doc page URL itself as PDF if it returns PDF bytes (e.g., showbidDocument/<id>)
+  - Otherwise extracts documentdownload/pdf links from the HTML
+- Usage:
+  - `-?` prints a single-line example and exits
+
+S3 layout (if --upload-s3):
+  s3://<bucket>/<prefix>/YYYY/MM/DD/json/latest_bids_YYYYMMDD_HHMMSS.json
+  s3://<bucket>/<prefix>/YYYY/MM/DD/pdfs/<bid_no>_<b_id>.pdf
+"""
+
 import argparse
 import json
 import re
 import sys
 import time
 from pathlib import Path
-from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin
 
 import requests
 
@@ -25,13 +45,15 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
 
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
 
 
-def print_one_line_usage_and_exit():
+def print_one_line_usage_and_exit() -> None:
     print("\nUSAGE:")
     print(
         'python gem_latest.py '
@@ -41,27 +63,46 @@ def print_one_line_usage_and_exit():
         '--out latest_bids.json '
         '--download-pdf '
         '--pdf-dir pdfs '
-        '--pdf-timeout 90'
+        '--pdf-timeout 90 '
+        '--upload-s3 '
+        '--s3-bucket svt-gem-dw-1 '
+        '--s3-prefix gemdw'
     )
     print()
     sys.exit(0)
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def date_prefix_ist(dt: datetime) -> str:
+    return dt.strftime("%Y/%m/%d")
+
+
+def ts_compact_ist(dt: datetime) -> str:
+    return dt.strftime("%Y%m%d_%H%M%S")
+
+
+def s3_key_join(prefix: str, *parts: str) -> str:
+    prefix = (prefix or "").strip("/")
+    rest = "/".join(p.strip("/") for p in parts if p)
+    return f"{prefix}/{rest}" if prefix else rest
 
 
 def extract_csrf(html: str) -> str:
     m = re.search(r"csrf_bd_gem_nk'\s*:\s*'([0-9a-f]{16,64})'", html, re.I)
     if m:
         return m.group(1)
-
     m = re.search(r'name="csrf_bd_gem_nk"\s+value="([0-9a-f]{16,64})"', html, re.I)
     if m:
         return m.group(1)
-
     raise RuntimeError("CSRF token not found in /all-bids HTML.")
 
 
 def normalize_ms(value) -> int:
     """
-    GeM sometimes returns date sort fields as:
+    GeM date sort fields sometimes arrive as:
       - int
       - [int]
       - []
@@ -112,6 +153,24 @@ def normalize_id(value) -> str:
     return m.group(0) if m else ""
 
 
+def normalize_bid_no(value) -> str:
+    """
+    Fixes b_bid_number variants:
+      'GEM/2025/B/7051937' -> 'GEM/2025/B/7051937'
+      ['GEM/2025/B/7051937'] -> 'GEM/2025/B/7051937'
+      None / [] -> ''
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        if not value:
+            return ""
+        return normalize_bid_no(value[0])
+    return str(value).strip()
+
+
 def bid_doc_url(doc: dict) -> str:
     """
     Mirrors GeM JS:
@@ -136,8 +195,8 @@ def bid_doc_url(doc: dict) -> str:
 
 def contains_state(doc: dict, state: str) -> bool:
     """
-    Broad scan across all string values, because GeM doesn't consistently expose
-    a single "consignee_state" field in docs.
+    Broad scan across all string values because GeM doesn't expose a stable
+    "consignee_state" field in docs.
     """
     st = state.strip().lower()
 
@@ -181,7 +240,8 @@ def fetch_docs(session: requests.Session, csrf: str, page: int, keyword: str) ->
 
 
 def safe_filename(name: str) -> str:
-    name = name.strip()
+    # Windows-safe filenames
+    name = (name or "").strip()
     name = re.sub(r"[<>:\"/\\|?*\n\r\t]+", "_", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name[:180] if len(name) > 180 else name
@@ -192,8 +252,7 @@ def looks_like_pdf(resp: requests.Response) -> bool:
     if "application/pdf" in ctype or "pdf" in ctype:
         return True
     try:
-        head = resp.content[:5]
-        return head == b"%PDF-"
+        return resp.content[:5] == b"%PDF-"
     except Exception:
         return False
 
@@ -202,13 +261,13 @@ def resolve_pdf_url(
     session: requests.Session,
     doc_url: str,
     pdf_timeout: int,
-    debug_dir: Path
+    debug_dir: Path,
 ) -> tuple[str | None, Path | None]:
     """
     Returns (pdf_url, debug_html_path_if_any)
 
     Behavior:
-    1) GET doc_url. If it returns PDF -> pdf_url = doc_url (ACCEPT as direct PDF URL).
+    1) GET doc_url. If it returns PDF -> pdf_url = doc_url (acceptable direct PDF URL).
     2) Else treat response as HTML and try to extract a PDF/documentdownload URL.
        If cannot find, save HTML for debugging.
     """
@@ -223,17 +282,17 @@ def resolve_pdf_url(
     r = session.get(doc_url, headers=headers, timeout=pdf_timeout, allow_redirects=True)
     r.raise_for_status()
 
-    # ✅ Case 1: doc_url itself is PDF
     if looks_like_pdf(r):
         return doc_url, None
 
     html = r.text
 
-    # Case 2: Extract a PDF URL from HTML
+    # direct .pdf links
     m = re.search(r'href\s*=\s*["\']([^"\']+\.pdf)["\']', html, re.I)
     if m:
         return urljoin(doc_url, m.group(1)), None
 
+    # /bidding/bid/documentdownload/... (with or without .pdf)
     m = re.search(r'["\'](\/bidding\/bid\/documentdownload\/[^"\']+?\.pdf)["\']', html, re.I)
     if m:
         return urljoin(doc_url, m.group(1)), None
@@ -242,6 +301,7 @@ def resolve_pdf_url(
     if m:
         return urljoin(doc_url, m.group(1)), None
 
+    # /bidding/bid/documentDownload/...
     m = re.search(r'["\'](\/bidding\/bid\/documentDownload\/[^"\']+)["\']', html, re.I)
     if m:
         return urljoin(doc_url, m.group(1)), None
@@ -258,7 +318,7 @@ def download_file(
     url: str,
     out_path: Path,
     referer: str,
-    timeout: int = 60
+    timeout: int = 60,
 ) -> bool:
     """
     Downloads PDF with correct Referer + cookies (session).
@@ -279,7 +339,7 @@ def download_file(
             log(f"PDF GET status={r.status_code} content-type={ctype} final_url={r.url}")
             r.raise_for_status()
 
-            # If content-type is not PDF, peek at magic bytes
+            # If content-type isn't PDF, verify magic bytes
             if "pdf" not in ctype:
                 peek = r.raw.read(5, decode_content=True)
                 if peek != b"%PDF-":
@@ -309,25 +369,19 @@ def download_file(
         log(f"❌ Download failed: {url} -> {out_path.name} | {e}")
         return False
 
-def normalize_bid_no(value) -> str:
-    """
-    Fixes b_bid_number variants:
-      'GEM/2025/B/7051937' -> 'GEM/2025/B/7051937'
-      ['GEM/2025/B/7051937'] -> 'GEM/2025/B/7051937'
-      None / [] -> ''
-    """
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, list):
-        if not value:
-            return ""
-        return normalize_bid_no(value[0])
-    return str(value).strip()
+
+def upload_file_to_s3(local_path: Path, bucket: str, key: str) -> None:
+    try:
+        import boto3  # lazy import so local usage doesn't require boto3
+    except Exception as e:
+        raise RuntimeError("boto3 is required for --upload-s3. Install with: pip install boto3") from e
+
+    s3 = boto3.client("s3")
+    s3.upload_file(str(local_path), bucket, key)
+    log(f"✅ Uploaded to s3://{bucket}/{key}")
 
 
-def main():
+def main() -> None:
     if "-?" in sys.argv:
         print_one_line_usage_and_exit()
 
@@ -341,6 +395,10 @@ def main():
     parser.add_argument("--download-pdf", action="store_true", help="Auto-download bid PDF for each matched bid")
     parser.add_argument("--pdf-dir", default="pdfs", help="Directory to save PDFs (default: pdfs)")
     parser.add_argument("--pdf-timeout", type=int, default=90, help="Timeout seconds per PDF download")
+
+    parser.add_argument("--upload-s3", action="store_true", help="Upload output JSON and PDFs to S3")
+    parser.add_argument("--s3-bucket", default="", help="S3 bucket name")
+    parser.add_argument("--s3-prefix", default="", help="S3 prefix (folder)")
 
     args = parser.parse_args()
 
@@ -357,6 +415,10 @@ def main():
     if args.download_pdf:
         log(f"PDF dir       : {args.pdf_dir}")
         log(f"PDF timeout   : {args.pdf_timeout}")
+    log(f"Upload S3     : {args.upload_s3}")
+    if args.upload_s3:
+        log(f"S3 bucket     : {args.s3_bucket}")
+        log(f"S3 prefix     : {args.s3_prefix}")
 
     session = requests.Session()
     session.headers.update({"User-Agent": UA})
@@ -368,7 +430,7 @@ def main():
     csrf = extract_csrf(r.text)
     log("CSRF obtained")
 
-    results = []
+    results: list[dict] = []
     scanned_total = 0
 
     for page in range(1, max_pages + 1):
@@ -418,7 +480,7 @@ def main():
                 "pdf_path": "",
             }
 
-            # PDF download section (UPDATED: accept doc_url as direct PDF if it returns PDF)
+            # PDF download section (accept doc_url as direct PDF if it returns PDF)
             if args.download_pdf and doc_url:
                 pdf_dir = Path(args.pdf_dir)
                 debug_html_dir = pdf_dir / "debug_html"
@@ -438,6 +500,7 @@ def main():
                         log(f"PDF URL resolved: {pdf_url}")
                         item["pdf_url"] = pdf_url
 
+                        # deterministic filename (overwrite ok for same bid id)
                         base = safe_filename(f"{bid_no}_{b_id}") or b_id or f"bid_{page}_{idx}"
                         out_pdf = pdf_dir / f"{base}.pdf"
 
@@ -461,14 +524,40 @@ def main():
 
         time.sleep(0.2)
 
-    with open(args.out, "w", encoding="utf-8") as f:
+    # 2) Save JSON output locally
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True) if out_path.parent else None
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
     log("========== Completed ==========")
     log(f"Total scanned docs: {scanned_total}")
     log(f"Total matches     : {len(results)}")
-    log(f"Saved JSON        : {args.out}")
+    log(f"Saved JSON        : {out_path}")
 
+    # 3) Optional S3 upload (date prefix BEFORE pdfs/json)
+    if args.upload_s3:
+        if not args.s3_bucket:
+            raise RuntimeError("--upload-s3 requires --s3-bucket")
+
+        run_dt = now_ist()
+        date_prefix = date_prefix_ist(run_dt)  # YYYY/MM/DD
+        run_ts = ts_compact_ist(run_dt)        # YYYYMMDD_HHMMSS
+
+        # JSON: timestamped name to avoid overwrite
+        json_name = f"latest_bids_{run_ts}.json"
+        json_key = s3_key_join(args.s3_prefix, date_prefix, "json", json_name)
+        upload_file_to_s3(out_path, args.s3_bucket, json_key)
+
+        # PDFs: overwrite ok for same filename
+        if args.download_pdf:
+            pdf_dir = Path(args.pdf_dir)
+            if pdf_dir.exists():
+                for pdf in pdf_dir.glob("*.pdf"):
+                    pdf_key = s3_key_join(args.s3_prefix, date_prefix, "pdfs", pdf.name)
+                    upload_file_to_s3(pdf, args.s3_bucket, pdf_key)
+
+    # Summary preview
     for i, r in enumerate(results[:20], 1):
         extra = f" | PDF: {r['pdf_path']}" if r.get("pdf_path") else ""
         log(f"{i}. {r.get('bid_number','')} | {r.get('start_utc','')} | {r.get('doc_url','')}{extra}")
