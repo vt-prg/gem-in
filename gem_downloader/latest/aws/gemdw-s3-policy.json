@@ -1,0 +1,18 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PutObjectsUnderPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::svt-gem-dw-1/gemdw/*"
+    },
+    {
+      "Sid": "ListBucketForPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::svt-gem-dw-1",
+      "Condition": { "StringLike": { "s3:prefix": ["gemdw/*"] } }
+    }
+  ]
+}

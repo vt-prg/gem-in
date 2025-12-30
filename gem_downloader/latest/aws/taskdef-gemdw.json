@@ -1,0 +1,24 @@
+{
+  "family": "gemdw-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::843581821008:role/ecsTaskExecutionRole-gemdw",
+  "taskRoleArn": "arn:aws:iam::843581821008:role/ecsTaskRole-gemdw",
+  "containerDefinitions": [
+    {
+      "name": "gemdw",
+      "image": "843581821008.dkr.ecr.ap-south-1.amazonaws.com/gemdw:latest",
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/gemdw",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "gemdw"
+        }
+      }
+    }
+  ]
+}
